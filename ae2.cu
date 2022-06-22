@@ -36,12 +36,15 @@ static float3 _camRot;
 
 struct octreeNode
 {
-	octreeNode* children[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
-	octreeNode* b = nullptr;
-	float3 center;
+	struct octreeNode* children[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+	struct octreeNode* b = nullptr;
+	float3 min;
+	float3 max;
+	int *faceData = nullptr;
+	int stride = 0;
 };
 
-static octreeNode *_octree;
+static octreeNode *_octree = nullptr;
 
 // Math Utils
 __host__ __device__ float _dot_d(float3 x, float3 y)
@@ -349,15 +352,64 @@ __device__ bool _rayTriangleIntersect(const float3 orig, const float3 dir, const
 	if (*t < 0.0f) return false;
 	return true;
 }
-__device__ bool _rayBboxIntersect(float3 ro, float3 rd, float3 bboxMin, float3 bboxMax, float &near) {
-	float3 tMin = _div_d((_sub_d(bboxMin, ro)), rd);
-	float3 tMax = _div_d((_sub_d(bboxMax, ro)), rd);
-	float3 t1 = { min(tMin.x, tMax.x), min(tMin.y, tMax.y), min(tMin.z, tMax.z) };
-	float3 t2 = { max(tMin.x, tMax.x), max(tMin.y, tMax.y), max(tMin.z, tMax.z) };
-	float tNear = max(max(t1.x, t1.y), t1.z);
-	float tFar = min(min(t2.x, t2.y), t2.z);
-	near = min(tNear, tFar);
-	return tFar > tNear;
+__device__ bool _rayBboxIntersect(float3 ro, float3 rd, float3 bboxMin, float3 bboxMax, float &near) 
+{
+	float tmin = (bboxMin.x - ro.x) / rd.x;
+	float tmax = (bboxMax.x - ro.x) / rd.x;
+
+	if (tmin > tmax)
+	{
+		float temp = tmin;
+		tmin = tmax;
+		tmax = temp;
+	}
+
+	float tymin = (bboxMin.y - ro.y) / rd.y;
+	float tymax = (bboxMax.y - ro.y) / rd.y;
+
+	if (tymin > tymax)
+	{
+		float temp = tymin;
+		tymin = tymax;
+		tymax = temp;
+	}
+
+	if ((tmin > tymax) || (tymin > tmax))
+		return false;
+
+	if (tymin > tmin)
+		tmin = tymin;
+
+	if (tymax < tmax)
+		tmax = tymax;
+
+	float tzmin = (bboxMin.z - ro.z) / rd.z;
+	float tzmax = (bboxMax.z - ro.z) / rd.z;
+
+	if (tmin > tmax)
+	{
+		float temp = tzmin;
+		tzmin = tzmax;
+		tzmax = temp;
+	}
+
+	if ((tmin > tzmax) || (tzmin > tmax))
+		return false;
+
+	if (tzmin > tmin)
+		tmin = tzmin;
+
+	if (tzmax < tmax)
+		tmax = tzmax;
+
+	near = tmin;
+
+	if (near < 0) {
+		near = tmax;
+		if (near < 0) return false;
+	}
+
+	return true;
 };
 __global__ void _PathTrace_d(int* _faceBufferData, int _triangleCount, float* _vertexBufferData, float* _bvhBufferData, int _bvhCount, float* _attrBufferData, float* _protoBufferData, curandState* _randAr, int2 _screenRes, int2 _topLeftCoord, float3 _camPos_d, float3 _camRot_d)
 {
@@ -484,116 +536,142 @@ __global__ void _PathTrace_d(int* _faceBufferData, int _triangleCount, float* _v
 	}
 }
 
-__global__ void _OctreePathTrace_d(octreeNode* octree, int maxDepth, float* _protoBufferData, curandState* _randAr, int2 _screenRes, int2 _topLeftCoord, float3 _camPos_d, float3 _camRot_d)
+__global__ void _OctreePathTrace_d(octreeNode* octree, int maxDepth, float* _protoBufferData, float *_vertexBufferData, float *_attrBufferData, curandState* _randAr, int2 _screenRes, int2 _topLeftCoord, float3 _camPos_d, float3 _camRot_d)
 {
 	float2 localUV = { ((float)tid + _topLeftCoord.x) / _screenRes.x, ((float)bid + _topLeftCoord.y) / _screenRes.y };
 	float3 ro = _camPos_d;
 	float3 rd = _rotate(_norm_d({ localUV.x * 2.0f - 1.0f, localUV.y * 2.0f - 1.0f, 1.0f }), _camRot_d, { 0.0f, 0.0f, 0.0f });
 
+	ro = _add_d(ro, _mul_d(rd, { 0.01, 0.01, 0.01 }));
+
 	float3 rc{ 0.04f, 0.04f, 0.04f };
 	float eta = 1.45f;
 	
 	int depth = 0;
-	for (int j = 0;j < 120;j++)
+	for (int j = 0;j < 200;j++)
 	{
+		
 		octreeNode* curNode = octree;
 		
 		depth = 0;
 		for (int i = 0;i < maxDepth;i++)
 		{
-			if (!(fabsf(ro.x - curNode->center.x) < 25.0f / ((i + 1) * (i + 1)) &&
-				fabsf(ro.y - curNode->center.y) < 25.0f / ((i + 1) * (i + 1)) &&
-				fabsf(ro.z - curNode->center.z) < 25.0f / ((i + 1) * (i + 1))))
-			{
-				depth = i;
-				break;
-			}
-			bool bx = ro.x > curNode->center.x;
-			bool by = ro.y > curNode->center.y;
-			bool bz = ro.z > curNode->center.z;
+			depth = i;
+			if (curNode->faceData != NULL) break;
+			float3 center = _div_d(_add_d(curNode->min, curNode->max), { 2.0f, 2.0f, 2.0f });
+			int bx = ro.x < center.x;
+			int by = ro.y < center.y;
+			int bz = ro.z < center.z;
 			bool moved = false;
-			if (curNode == NULL) printf("When\n");
-			if (bx && by && bz)
+			int idx = bx + by * 2 + bz * 4;
+			if (curNode->children[idx] != NULL)
 			{
-				if (curNode->children[0] != NULL)
-				{
-					curNode = curNode->children[0];
-					moved = true;
-				}
-			}
-			else if (bx && by && !bz)
-			{
-				if (curNode->children[1] != NULL)
-				{
-					curNode = curNode->children[1];
-					moved = true;
-				}
-			}
-			else if (bx && !by && bz)
-			{
-
-				if (curNode->children[2] != NULL)
-				{
-					curNode = curNode->children[2];
-					moved = true;
-				}
-			}
-			else if (!bx && by && bz)
-			{
-				if (curNode->children[3] != NULL)
-				{
-					curNode = curNode->children[3];
-					moved = true;
-				}
-			}
-			else if (!bx && by && !bz)
-			{
-				if (curNode->children[4] != NULL)
-				{
-					curNode = curNode->children[4];
-					moved = true;
-				}
-			}
-			else if (!bx && !by && bz)
-			{
-				if (curNode->children[5] != NULL)
-				{
-					curNode = curNode->children[5];
-					moved = true;
-				}
-			}
-			else if (bx && !by && !bz)
-			{
-				if (curNode->children[6] != NULL)
-				{
-					curNode = curNode->children[6];
-					moved = true;
-				}
+				curNode = curNode->children[idx];
 			}
 			else
 			{
-				if (curNode->children[7] != NULL)
+				break;
+			}
+		}
+		
+		if (curNode->faceData != nullptr)
+		{
+			
+			int minTrid = -1;
+			float minT = 1e+6, minU, minV;
+			for (int trid = 0;trid < curNode->stride / 3;trid++)
+			{
+				
+				int vert_i = curNode->faceData[trid * 3] * 3;
+				float3 v0{ _vertexBufferData[vert_i], _vertexBufferData[vert_i + 1], _vertexBufferData[vert_i + 2] };
+				vert_i = curNode->faceData[trid * 3 + 1] * 3;
+				float3 v1{ _vertexBufferData[vert_i], _vertexBufferData[vert_i + 1], _vertexBufferData[vert_i + 2] };
+				vert_i = curNode->faceData[trid * 3 + 2] * 3;
+				float3 v2{ _vertexBufferData[vert_i], _vertexBufferData[vert_i + 1], _vertexBufferData[vert_i + 2] };
+				float t, u, v;
+				if (_rayTriangleIntersect(_camPos_d, rd, v0, v1, v2, &t, &u, &v))
 				{
-					curNode = curNode->children[7];
-					moved = true;
+					if (t < minT)
+					{
+						minTrid = trid;
+						minT = t;
+						minU = u;
+						minV = v;
+					}
 				}
 			}
-			if (!moved)
+			if (minTrid > -1)
 			{
-				depth = i;
+
+				ro = _camPos_d;
+				
+				ro = _add_d(ro, _mul_d(rd, { minT, minT, minT }));
+
+				
+
+				int vert_i = curNode->faceData[minTrid * 3] * 3;
+				float3 v0{ _vertexBufferData[vert_i], _vertexBufferData[vert_i + 1], _vertexBufferData[vert_i + 2] };
+				vert_i = curNode->faceData[minTrid * 3 + 1] * 3;
+				float3 v1{ _vertexBufferData[vert_i], _vertexBufferData[vert_i + 1], _vertexBufferData[vert_i + 2] };
+				vert_i = curNode->faceData[minTrid * 3 + 2] * 3;
+				float3 v2{ _vertexBufferData[vert_i], _vertexBufferData[vert_i + 1], _vertexBufferData[vert_i + 2] };
+				float3 norm = _norm_d(_cross_d(_sub_d(v2, v0), _sub_d(v1, v0)));
+
+				float dNI = _dot_d(rd, norm);
+				if (dNI > 0.0f)
+				{
+					norm = _mul_d(norm, { -1.0f, -1.0f, -1.0f });
+					dNI = _dot_d(rd, norm);
+				}
+
+				int triangleAttr_i = minTrid * 5;
+				float3 color = {
+					_attrBufferData[triangleAttr_i],
+					_attrBufferData[triangleAttr_i + 1],
+					_attrBufferData[triangleAttr_i + 2],
+				};
+
+				float Kr = _attrBufferData[triangleAttr_i + 3];
+				bool isRefract = _attrBufferData[triangleAttr_i + 4] > 0.0f;
+
+				if (!isRefract)
+				{
+					rd = _sub_d(rd, _mul_d({ 2.0f, 2.0f, 2.0f }, _mul_d({ dNI, dNI, dNI }, norm)));
+				}
+				else
+				{
+					eta = 1.0f / eta;
+
+					float k = 1.0f - eta * eta * (1.0f - dNI * dNI);
+					if (k < 0.0f)
+					{
+						rd = _sub_d(rd, _mul_d({ 2.0f, 2.0f, 2.0f }, _mul_d({ dNI, dNI, dNI }, norm)));
+					}
+					else
+					{
+						float n = eta * dNI + sqrtf(k);
+						rd = _sub_d(_mul_d({ eta, eta, eta }, rd), _mul_d({ n, n, n }, norm));
+					}
+				}
+
+				rd.x += curand_uniform(&_randAr[(bid + blockIdx.y * 128) * 32 + tid]) * Kr - 0.5f * Kr;
+				rd.y += curand_uniform(&_randAr[(bid + blockIdx.y * 128) * 32 + tid]) * Kr - 0.5f * Kr;
+				rd.z += curand_uniform(&_randAr[(bid + blockIdx.y * 128) * 32 + tid]) * Kr - 0.5f * Kr;
+				rd = _norm_d(rd);
+
+				ro = _add_d(ro, _mul_d(rd, { 0.001f, 0.001f, 0.001f }));
+
+				rc.x *= color.x;
+				rc.y *= color.y;
+				rc.z *= color.z;
+				if (color.x + color.y + color.z > 10.0f) break;
 			}
-			if (i == maxDepth - 1) depth = i;
+			else
+			{
+				rc = { 0.0f, 0.0f, 0.0f };
+			}
 		}
-		float sF = (float)((depth * 0.5f + 0.5f) * (depth * 0.5f + 0.5f));
-		
-		if (depth >= maxDepth - 7)
-		{
-			rc = { 100.0f, 100.0f, 100.0f };
-			break;
-		}
-		float t = 1.0f;
-		_rayBboxIntersect(ro, rd, { curNode->center.x - 25.0f / sF, curNode->center.y - 25.0f / sF, curNode->center.z - 25.0f / sF }, { curNode->center.x + 25.0f / sF, curNode->center.y + 25.0f / sF, curNode->center.z + 25.0f / sF }, t);
-		ro = _add_d(ro, _mul_d(rd, { t + 0.01f, t + 0.01f, t + 0.01f }));
+		ro = _add_d(ro, _mul_d(rd, { 1.0f / (float)((depth + 1) * (depth + 1)), 1.0f / (float)((depth + 1) * (depth + 1)), 1.0f / (float)((depth + 1) * (depth + 1)) }));
 	}
 
 	int basePid = ((tid + _topLeftCoord.x) + (bid + _topLeftCoord.y) * (_screenRes.x)) * 3;
@@ -636,201 +714,155 @@ void _OctreePathTrace()
 	{
 		for (int x = 0;x < _screenRes.x << 1;x += 512)
 		{
-			_OctreePathTrace_d<<<512, 512>>>(_octree, 10, _protoBuffer.data, randAr_d, { _screenRes.x << 1, _screenRes.y << 1 }, { x, y }, _camPos, _camRot);
+			_OctreePathTrace_d<<<512, 512>>>(_octree, 10, _protoBuffer.data, _vertexBuffer.data, _attrBuffer.data, randAr_d, { _screenRes.x << 1, _screenRes.y << 1 }, { x, y }, _camPos, _camRot);
 			_FragmentShader();
 			aeWindowUpdate();
 		}
 	}
 }
-__device__ void _RecursiveOctreeGen(octreeNode *octree, float3 offset, int depth, float *vertices, int vertexCount, int cIdx)
-{
-	
-	octreeNode* node = (octreeNode*)malloc(sizeof(octreeNode));
-	float sF = (float)((depth + 1) * (depth + 1));
-	node->center = _add_d(octree->center, _div_d(offset, { sF, sF, sF }));
-	node->b = octree;
-	if (depth < 5)
-	{
-		bool nodeA = false;
-		for (int i = 0;i < vertexCount;i++)
-		{
-			int tidx = i * 3;
-			
-			float3 v{ vertices[tidx], vertices[tidx + 1], vertices[tidx + 2] };
-			if (fabsf(v.x - node->center.x) < 50.0f / sF &&
-				fabsf(v.y - node->center.y) < 50.0f / sF &&
-				fabsf(v.z - node->center.z) < 50.0f / sF)
-			{
-				bool bx = v.x > node->center.x;
-				bool by = v.y > node->center.y;
-				bool bz = v.z > node->center.z;
-				if (bx && by && bz)
-				{
-					_RecursiveOctreeGen(node, { 50.0f, 50.0f, 50.0f }, depth + 1, vertices, vertexCount, 0);
-					nodeA = true;
-				}
-				else if (bx && by && !bz)
-				{
-					_RecursiveOctreeGen(node, { 50.0f, 50.0f, -50.0f }, depth + 1, vertices, vertexCount, 1);
-					nodeA = true;
-				}
-				else if (bx && !by && bz)
-				{
-					_RecursiveOctreeGen(node, { 50.0f, -50.0f, 50.0f }, depth + 1, vertices, vertexCount, 2);
-					nodeA = true;
-				}
-				else if (!bx && by && bz)
-				{
-					_RecursiveOctreeGen(node, { -50.0f, 50.0f, 50.0f }, depth + 1, vertices, vertexCount, 3);
-					nodeA = true;
-				}
-				else if (!bx && by && !bz)
-				{
-					_RecursiveOctreeGen(node, { -50.0f, 50.0f, -50.0f }, depth + 1, vertices, vertexCount, 4);
-					nodeA = true;
-				}
-				else if (!bx && !by && bz)
-				{
-					_RecursiveOctreeGen(node, { -50.0f, -50.0f, 50.0f }, depth + 1, vertices, vertexCount, 5);
-					nodeA = true;
-				}
-				else if (bx && !by && !bz)
-				{
-					_RecursiveOctreeGen(node, { 50.0f, -50.0f, -50.0f }, depth + 1, vertices, vertexCount, 6);
-					nodeA = true;
-				}
-				else
-				{
-					_RecursiveOctreeGen(node, { -50.0f, -50.0f, -50.0f }, depth + 1, vertices, vertexCount, 7);
-					nodeA = true;
-				}
-			}
-		}
 
-
-		if (nodeA) octree->children[cIdx] = node;
-	}
-	else octree->children[cIdx] = node;
-}
-__global__ void _OctreeGen(octreeNode* octree, float* vertices, int vertexCount)
+__global__ void _OctreeGen(octreeNode* octree, float* vertices, int* faces, int fid, curandState* _randAr)
 {
+
+	octree->min = { -10.0f, -10.0f, -10.0f };
+	octree->max = { 10.0f, 10.0f, 10.0f };
 	octreeNode* curNode = octree;
 
-	float depth = 0;
+	int vert_i = faces[bid * 3] * 3;
+	float3 v0{ vertices[vert_i], vertices[vert_i + 1], vertices[vert_i + 2] };
+	vert_i = faces[bid * 3 + 1] * 3;
+	float3 v1{ vertices[vert_i], vertices[vert_i + 1], vertices[vert_i + 2] };
+	vert_i = faces[bid * 3 + 2] * 3;
+	float3 v2{ vertices[vert_i], vertices[vert_i + 1], vertices[vert_i + 2] };
 
-	float3 v{ vertices[bid * 3], vertices[bid * 3 + 1], vertices[bid * 3 + 2] };
+	int stack[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	int depth = 0;
 
-	for (int i = 0;i < 10;i++)
+	while (true)
 	{
-		if (!(fabsf(v.x - curNode->center.x) < 25.0f / ((i + 1) * (i + 1)) &&
-			fabsf(v.y - curNode->center.y) < 25.0f / ((i + 1) * (i + 1)) &&
-			fabsf(v.z - curNode->center.z) < 25.0f / ((i + 1) * (i + 1))))
+		if (curNode == NULL)
 		{
-			depth = i;
-			break;
-		}
-		bool bx = v.x > curNode->center.x;
-		bool by = v.y > curNode->center.y;
-		bool bz = v.z > curNode->center.z;
-		bool moved = false;
-		if (curNode == NULL) printf("When\n");
-		int createIdx = 0;
-		if (bx && by && bz)
-		{
-			if (curNode->children[0] != NULL)
+			curNode = octree;
+			depth = 0;
+			stack[depth]++;
+			if (stack[depth] > 7)
 			{
-				curNode = curNode->children[0];
-				moved = true;
+				break;
 			}
 		}
-		else if (bx && by && !bz)
-		{
-			createIdx = 1;
-			if (curNode->children[1] != NULL)
-			{
-				curNode = curNode->children[1];
-				moved = true;
-			}
-		}
-		else if (bx && !by && bz)
-		{
-			createIdx = 2;
-			if (curNode->children[2] != NULL)
-			{
-				curNode = curNode->children[2];
-				moved = true;
-			}
-		}
-		else if (!bx && by && bz)
-		{
-			createIdx = 3;
-			if (curNode->children[3] != NULL)
-			{
-				curNode = curNode->children[3];
-				moved = true;
-			}
-		}
-		else if (!bx && by && !bz)
-		{
-			createIdx = 4;
-			if (curNode->children[4] != NULL)
-			{
-				curNode = curNode->children[4];
-				moved = true;
-			}
-		}
-		else if (!bx && !by && bz)
-		{
 
-			createIdx = 5;
-			if (curNode->children[5] != NULL)
-			{
-				curNode = curNode->children[5];
-				moved = true;
-			}
-		}
-		else if (bx && !by && !bz)
+		float sF = (float)((depth + 1) * (depth + 1));
+		bool bx = (stack[depth] & 0b1) == 1;
+		bool by = (stack[depth] & 0b10) == 2;
+		bool bz = (stack[depth] & 0b100) == 4;
+		
+		float3 minC = curNode->min, maxC = curNode->max;
+
+		if (bx) minC.x += 5.0f / sF;
+		else maxC.x -= 5.0f / sF;
+		if (by) minC.y += 5.0f / sF;
+		else maxC.y -= 5.0f / sF;
+		if (bz) minC.z += 5.0f / sF;
+		else maxC.z -= 5.0f / sF;
+
+		float3 center = _div_d(_add_d(minC, maxC), { 2.0f, 2.0f, 2.0f });
+
+		float3 ro = center;
+		float3 rd = _norm_d(_sub_d(_div_d(_add_d(_add_d(v0, v1), v2), { 3.0f, 3.0f, 3.0f }), ro));
+
+
+
+
+		float t1, t2, u, v;
+		_rayBboxIntersect(
+			ro,
+			rd,
+			minC,
+			maxC,
+			t1
+		);
+		_rayTriangleIntersect(ro, rd, v0, v1, v2, &t2, &u, &v);
+		bool moved = t2 > t1;
+
+		if (!moved || curNode->faceData != NULL)
 		{
-			createIdx = 6;
-			if (curNode->children[6] != NULL)
+			if (curNode->faceData != NULL)
 			{
-				curNode = curNode->children[6];
-				moved = true;
+				if (curNode->stride < 50 * 3 - 3)
+				{
+					curNode->faceData[curNode->stride] = faces[bid * 3];
+					curNode->faceData[curNode->stride + 1] = faces[bid * 3 + 1];
+					curNode->faceData[curNode->stride + 2] = faces[bid * 3 + 2];
+					curNode->stride += 3;
+				}
 			}
+			stack[depth]++;
 		}
 		else
 		{
-			createIdx = 7;
-			if (curNode->children[7] != NULL)
+			if (curNode->children[stack[depth]] == NULL)
 			{
-				curNode = curNode->children[7];
-				moved = true;
+				octreeNode* node = new octreeNode;
+				if (node == NULL) break;
+				node->min = minC;
+				node->max = maxC;
+				node->b = curNode;
+				curNode->children[stack[depth]] = node;
+
+				depth++;
+				if (depth >= 9)
+				{
+					node->faceData = (int*)malloc(sizeof(int) * 50 * 3);
+					if (node->faceData == NULL)
+					{
+						printf("Bruh\n");
+						break;
+					}
+					else
+					{
+						printf("Dick\n");
+					}
+					node->faceData[0] = faces[bid * 3];
+					node->faceData[1] = faces[bid * 3 + 1];
+					node->faceData[2] = faces[bid * 3 + 2];
+					node->stride += 3;
+				}
+				curNode = node;
+				stack[depth] = 0;
+			}
+			else
+			{
+				depth++;
+				curNode = curNode->children[stack[depth]];
 			}
 		}
-		if (!moved)
+
+		bool isBreak = false;
+		for (int n = 0;n < 10;n++)
 		{
-			octreeNode* node = (octreeNode*)malloc(sizeof(octreeNode));
-			float sF = (float)((i + 1) * (i + 1));
-			node->center = curNode->center;
-			if (bx) node->center.x += 50.0f / sF;
-			else node->center.x -= 50.0f / sF;
-			if (by) node->center.y += 50.0f / sF;
-			else node->center.y -= 50.0f / sF;
-			if (bz) node->center.z += 50.0f / sF;
-			else node->center.z -= 50.0f / sF;
-			if (bx) node->center.x += 50.0f / sF;
-			node->b = curNode;
-			curNode->children[createIdx] = node;
-			printf("Node Created\n");
-			break;
+			if (stack[depth] > 7)
+			{
+				if (depth <= 0)
+				{
+					isBreak = true;
+					break;
+				}
+				stack[depth] = 0;
+				depth--;
+				curNode = curNode->b;
+				stack[depth]++;
+			}
 		}
+		if (isBreak) break;
 	}
+	
 }
+
 void aeOctree()
 {
 	cudaMalloc(&_octree, sizeof(octreeNode));
-	for (int i = 0;i < 10;i++) _OctreeGen<<<_vertexBuffer.size / 3, 1>>>(_octree, _vertexBuffer.data, _vertexBuffer.size / 3);
-	cudaDeviceSynchronize();
+	_OctreeGen << <_faceBuffer.size / 3, 1 >> > (_octree, _vertexBuffer.data, _faceBuffer.data, 0, randAr_d);
+	aeErrorCheck();
 }
 
 void aeRenderBuffer()
